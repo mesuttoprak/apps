@@ -1,0 +1,143 @@
+const { app } = require('@azure/functions');
+const axios = require('axios');
+const { htmlToText } = require('html-to-text');
+
+app.http('metojira', {
+    methods: ['POST'],
+    authLevel: 'anonymous',
+    handler: async (request, context) => {
+        context.log(`Http function processed request for URL "${request.url}"`);
+
+        // Read the request body as JSON
+        const payload = await request.json();
+
+        // Log the received payload
+        context.log('Received payload:', payload);
+
+        // Check if the event is for webhook verification
+        if (payload.event === 'webhook.verify') {
+            const callbackUrl = payload.payload.callback;
+            context.log(`Webhook verification required. Callback URL: ${callbackUrl}`);
+
+            try {
+                const verifyResponse = await axios.get(callbackUrl);
+                context.log('Webhook verified:', verifyResponse.data);
+
+                return {
+                    status: 200,
+                    body: 'Webhook verified successfully'
+                };
+            } catch (error) {
+                context.log('Error verifying webhook:', error.response ? error.response.data : error.message);
+                return {
+                    status: 500,
+                    body: 'Error verifying webhook'
+                };
+            }
+        }
+
+        // Proceed with JIRA integration if the event is not webhook.verify
+        // Extract relevant data from the nested payload
+        const { subject, desc, pr, type, id, supplier } = payload.payload;
+
+        context.log('Extracted data:', { subject, desc, pr, type, id, supplier });
+
+        // Convert rich text to plain text
+        const plainDesc = htmlToText(desc);
+        context.log('Converted description:', plainDesc);
+
+        // Define the JIRA API endpoints and credentials
+        const jiraCreateEndpoint = 'https://nopeco.atlassian.net/rest/api/2/issue';
+        const jiraUpdateEndpoint = `https://nopeco.atlassian.net/rest/api/2/issue/${supplier}`;
+        const jiraUserName = process.env.JIRA_USERNAME;
+        const jiraPassword = process.env.JIRA_API_TOKEN;
+
+        // Construct the JIRA issue payload for creation
+        const jiraIssuePayload = {
+            fields: {
+                project: {
+                    key: pr // Replace with your JIRA project key
+                },
+                summary: subject,
+                description: plainDesc,
+                issuetype: { name: type }, // Assuming type is the JIRA issue type
+                customfield_10033: id // Replace with the appropriate custom field ID in JIRA
+            }
+        };
+
+        context.log('JIRA payload:', jiraIssuePayload);
+
+        try {
+            let response;
+
+            if (supplier) {
+                // Update the existing JIRA issue with a comment
+                context.log(`Updating JIRA issue with ID: ${supplier}`);
+                const commentPayload = {
+                    body: plainDesc
+                };
+                response = await axios.post(`${jiraUpdateEndpoint}/comment`, commentPayload, {
+                    auth: {
+                        username: jiraUserName,
+                        password: jiraPassword
+                    }
+                });
+                context.log('JIRA issue updated with comment:', response.data);
+            } else {
+                // Create a new JIRA issue
+                context.log('Creating a new JIRA issue');
+                response = await axios.post(jiraCreateEndpoint, jiraIssuePayload, {
+                    auth: {
+                        username: jiraUserName,
+                        password: jiraPassword
+                    }
+                });
+                context.log('JIRA issue created:', response.data);
+            }
+
+            // Extract the JIRA issue ID from the response
+            const jiraIssueId = response.data.key;
+            context.log('JIRA issue ID:', jiraIssueId);
+
+            // Define the 4me API endpoint for updating the request with the JIRA issue ID
+            const fourMeEndpoint = `https://api.4me-demo.com/requests/${id}`;
+
+            // Construct the payload for the 4me update
+            const fourMeUpdatePayload = {
+                supplier: 125, // Replace with your supplier ID in 4me
+                supplier_requestID: jiraIssueId // Replace with the appropriate custom field name in 4me
+            };
+
+            context.log('4me update payload:', fourMeUpdatePayload);
+            context.log('4me update request headers:', {
+                'Authorization': `Bearer ${process.env.FOURME_API_TOKEN}`,
+                'Content-Type': 'application/json',
+                'X-4me-Account': 'wdc'
+            });
+
+            // Make a PATCH request to the 4me API
+            const fourMeResponse = await axios.patch(fourMeEndpoint, fourMeUpdatePayload, {
+                headers: {
+                    'Authorization': `Bearer ${process.env.FOURME_API_TOKEN}`,
+                    'Content-Type': 'application/json',
+                    'X-4me-Account': 'wdc'
+                }
+            });
+
+            context.log('4me request updated:', fourMeResponse.data);
+
+            // Return a success response
+            return {
+                status: 200,
+                body: supplier ? 'JIRA issue updated successfully' : 'JIRA issue created successfully'
+            };
+        } catch (error) {
+            // Log and return an error response
+            context.log('Error with 4me API:', error.response ? error.response.data : error.message);
+            return {
+                status: 500,
+                body: 'Error processing 4me update'
+            };
+        }
+    }
+});
